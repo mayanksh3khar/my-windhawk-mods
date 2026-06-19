@@ -83,7 +83,18 @@ patterns can be used:
   * `%disk_total%` - combined disk read and write speed.
   * `%cpu%` - CPU usage.
   * `%ram%` - RAM usage.
+  * `%ram_used%` - Used RAM amount in GB.
+  * `%ram_total%` - Total RAM amount in GB.
+  * `%ram_committed%` - Committed RAM usage (% of memory reserved by apps, backed by RAM or swap)
+  * `%ram_committed_used%` - Used committed RAM amount in GB.
+  * `%ram_committed_total%` - Total committed RAM amount in GB.
   * `%gpu%` - GPU usage.
+  * `%vram%` - VRAM usage as a percentage of total dedicated VRAM.
+  * `%vram_used%` - Used dedicated VRAM amount in GB.
+  * `%vram_total%` - Total dedicated VRAM amount in GB.
+  * `%vram_shared%` - Shared VRAM (system RAM used as extra GPU memory)
+  * `%vram_shared_used%` - Used shared VRAM amount in GB.
+  * `%vram_shared_total%` - Total shared VRAM pool size in GB.
   * `%cpu_temp%` - CPU temperature in °C (average of all ACPI thermal zones).
   * `%cpu_temp_f%` - CPU temperature in °F (average of all ACPI thermal zones).
   * `%battery%` - battery level percentage.
@@ -184,6 +195,14 @@ styles, such as the font color and size.
   $description: >-
     Set to zero for the default system value. A negative value can be used for
     negative spacing.
+- GpuAdapterName: ""
+  $name: GPU adapter name
+  $description: >-
+    The GPU adapter to use for GPU usage and VRAM metrics. Leave empty to
+    auto-detect (uses the adapter with the most dedicated VRAM). Partial match is supported.
+    To list adapters, run:
+
+    wmic path win32_videocontroller get Name
 - DataCollection:
   - NetworkMetricsFormat: mbs
     $name: Network metrics format
@@ -225,13 +244,7 @@ styles, such as the font color and size.
       sum all adapters. Partial match is supported. To list adapters, run:
 
       typeperf -qx "Network Interface"
-  - GpuAdapterName: ""
-    $name: GPU adapter name
-    $description: >-
-      The GPU adapter to use for GPU usage metrics. Leave empty to sum all
-      adapters. Partial match is supported. To list adapters, run:
 
-      wmic path win32_videocontroller get Name
   $name: System performance metrics
 - MediaPlayer:
   - IgnoredPlayers: [""]
@@ -249,9 +262,14 @@ styles, such as the font color and size.
     $description: >-
       Text that will be shown for %media_info% when no media is playing.
   - RemoveBrackets: false
-    $name: Remove brackets from info
+    $name: Remove brackets from media info
     $description: >-
-      Remove text in brackets from media info. E.g., "Song (feat. Artist)"
+      Remove text in brackets from %media_info%. E.g., "Song (feat. Artist)"
+      becomes "Song".
+  - RemoveBracketsTitle: false
+    $name: Remove brackets from media title
+    $description: >-
+      Remove text in brackets from %media_title%. E.g., "Song (feat. Artist)"
       becomes "Song".
   $name: Media player info
 - WebContentWeatherLocation: ""
@@ -259,7 +277,7 @@ styles, such as the font color and size.
   $description: >-
     Get weather information for a specific location. Keep empty to use the
     current location. For details, refer to the documentation of wttr.in.
-- WebContentWeatherFormat: "%c \U0001F321\uFE0F%t \U0001F32C\uFE0F%w"
+- WebContentWeatherFormat: "%c \uD83C\uDF21\uFE0F%t \uD83C\uDF2C\uFE0F%w"
   $name: Weather format
   $description: >-
     The weather information format. For details, refer to the documentation of
@@ -506,6 +524,9 @@ using namespace winrt::Windows::UI::Xaml;
 #define URL_ESCAPE_ASCII_URI_COMPONENT 0x00080000
 #endif
 
+// fd
+DWORD GetDataCollectionFormatIndex();
+
 enum class TooltipLineMode {
     append,
     replace,
@@ -542,6 +563,7 @@ struct MediaPlayerSettings {
     int maxLength;
     StringSetting noMediaText;
     bool removeBrackets;
+    bool removeBracketsTitle;
 };
 
 enum class WebContentWeatherUnits {
@@ -666,7 +688,21 @@ FormattedString<FORMATTED_BUFFER_SIZE> g_diskWriteSpeedFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_diskTotalSpeedFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_cpuFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_ramFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_ramUsedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_ramTotalFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_ramCommitedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_ramCommitedUsedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_ramCommitedTotalFormatted;
+MEMORYSTATUSEX g_ramStatus;
+bool g_ramStatusValid = false;
+DWORD g_ramLastFormatIndex = 0xFFFFFFFF;
 FormattedString<FORMATTED_BUFFER_SIZE> g_gpuFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramUsedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramTotalFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramSharedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramSharedUsedFormatted;
+FormattedString<FORMATTED_BUFFER_SIZE> g_vramSharedTotalFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_cpuTempFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_cpuTempFFormatted;
 FormattedString<FORMATTED_BUFFER_SIZE> g_batteryFormatted;
@@ -1857,6 +1893,12 @@ enum class MetricType {
     kDiskWriteSpeed,
     kCpu,
     kGpuUsage,
+    kVramUsage,
+    kVramUsed,
+    kVramTotal,
+    kVramSharedUsage,
+    kVramSharedUsed,
+    kVramSharedTotal,
     kCpuTemp,
 
     kCount,
@@ -1882,6 +1924,12 @@ class QueryDataCollectionSession {
     bool SampleData();
     std::optional<double> QueryData(MetricType type);
     std::optional<double> QueryDataAvg(MetricType type);
+    std::optional<double> QueryVramUsage();
+    std::optional<double> QueryVramUsed();
+    std::optional<double> QueryVramTotal();
+    std::optional<double> QueryVramSharedUsage();
+    std::optional<double> QueryVramSharedUsed();
+    std::optional<double> QueryVramSharedTotal();
 
    private:
     struct QueryDataResult {
@@ -1904,6 +1952,9 @@ class QueryDataCollectionSession {
         const std::vector<std::wstring>& paths,
         PCWSTR gpu_name,
         bool quiet);
+    static void GetDxgiVideoMemory(PCWSTR gpu_name,
+                                   SIZE_T* dedicated,
+                                   SIZE_T* shared);
 
     std::vector<std::wstring> ExpandAndFilterWildcardPaths(MetricType type,
                                                            PCWSTR counter_path,
@@ -1912,10 +1963,14 @@ class QueryDataCollectionSession {
         auto paths = ExpandEnglishWildcard(counter_path, quiet);
 
         // Filter paths by adapter name if specified.
-        if (adapter_name && *adapter_name && !paths.empty()) {
-            if (type == MetricType::kGpuUsage) {
+        if (!paths.empty()) {
+            if (type == MetricType::kGpuUsage ||
+                type == MetricType::kVramUsed ||
+                type == MetricType::kVramSharedUsed) {
+                // For GPU metrics, we always filter (to auto-select the best
+                // adapter if name is empty).
                 paths = FilterGpuPathsByAdapterName(paths, adapter_name, quiet);
-            } else {
+            } else if (adapter_name && *adapter_name) {
                 paths =
                     FilterNetworkPathsByAdapterName(paths, adapter_name, quiet);
             }
@@ -1934,6 +1989,11 @@ class QueryDataCollectionSession {
         PCWSTR wildcard_path = nullptr;
         PCWSTR adapter_name = nullptr;
     };
+
+    // Cached VRAM info from DXGI (queried once).
+    SIZE_T vram_total_bytes_ = 0;
+    SIZE_T vram_shared_total_bytes_ = 0;
+    bool vram_total_queried_ = false;
 
     PDH_HQUERY query_;
     MetricData metrics_[static_cast<int>(MetricType::kCount)];
@@ -1970,6 +2030,21 @@ bool QueryDataCollectionSession::AddMetric(MetricType type) {
             is_wildcard = true;
             adapter_name = g_settings.dataCollection.gpuAdapterName;
             break;
+        case MetricType::kVramUsed:
+        case MetricType::kVramUsage:
+            counter_path = L"\\GPU Adapter Memory(*)\\Dedicated Usage";
+            is_wildcard = true;
+            adapter_name = g_settings.dataCollection.gpuAdapterName;
+            break;
+        case MetricType::kVramSharedUsed:
+        case MetricType::kVramSharedUsage:
+            counter_path = L"\\GPU Adapter Memory(*)\\Shared Usage";
+            is_wildcard = true;
+            adapter_name = g_settings.dataCollection.gpuAdapterName;
+            break;
+        case MetricType::kVramTotal:
+        case MetricType::kVramSharedTotal:
+            return true;  // Handled via DXGI
         case MetricType::kCpuTemp:
             counter_path = L"\\Thermal Zone Information(*)\\Temperature";
             is_wildcard = true;
@@ -2112,11 +2187,147 @@ QueryDataCollectionSession::QueryDataWithCount(MetricType type) {
 }
 
 std::optional<double> QueryDataCollectionSession::QueryData(MetricType type) {
+    if (type == MetricType::kVramUsage) {
+        return QueryVramUsage();
+    }
+    if (type == MetricType::kVramUsed) {
+        return QueryVramUsed();
+    }
+    if (type == MetricType::kVramTotal) {
+        return QueryVramTotal();
+    }
+    if (type == MetricType::kVramSharedUsage) {
+        return QueryVramSharedUsage();
+    }
+    if (type == MetricType::kVramSharedUsed) {
+        return QueryVramSharedUsed();
+    }
+    if (type == MetricType::kVramSharedTotal) {
+        return QueryVramSharedTotal();
+    }
     auto result = QueryDataWithCount(type);
     if (!result) {
         return std::nullopt;
     }
     return result->sum;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramUsage() {
+    auto used = QueryVramUsed();
+    auto total = QueryVramTotal();
+    if (used && total && *total > 0) {
+        return (*used / *total) * 100.0;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramUsed() {
+    auto result = QueryDataWithCount(MetricType::kVramUsed);
+    if (result) {
+        return result->sum / (1024.0 * 1024.0 * 1024.0);
+    }
+    return std::nullopt;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramTotal() {
+    if (!vram_total_queried_) {
+        GetDxgiVideoMemory(g_settings.dataCollection.gpuAdapterName,
+                           &vram_total_bytes_, &vram_shared_total_bytes_);
+        vram_total_queried_ = true;
+    }
+
+    if (vram_total_bytes_ > 0) {
+        return (double)vram_total_bytes_ / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    return std::nullopt;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramSharedUsage() {
+    auto used = QueryVramSharedUsed();
+    auto total = QueryVramSharedTotal();
+    if (used && total && *total > 0) {
+        return (*used / *total) * 100.0;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramSharedUsed() {
+    auto result = QueryDataWithCount(MetricType::kVramSharedUsed);
+    if (result) {
+        return result->sum / (1024.0 * 1024.0 * 1024.0);
+    }
+    return std::nullopt;
+}
+
+std::optional<double> QueryDataCollectionSession::QueryVramSharedTotal() {
+    if (!vram_total_queried_) {
+        GetDxgiVideoMemory(g_settings.dataCollection.gpuAdapterName,
+                           &vram_total_bytes_, &vram_shared_total_bytes_);
+        vram_total_queried_ = true;
+    }
+
+    if (vram_shared_total_bytes_ > 0) {
+        return (double)vram_shared_total_bytes_ / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    return std::nullopt;
+}
+
+void QueryDataCollectionSession::GetDxgiVideoMemory(PCWSTR gpu_name,
+                                                    SIZE_T* dedicated,
+                                                    SIZE_T* shared) {
+    if (dedicated) {
+        *dedicated = 0;
+    }
+    if (shared) {
+        *shared = 0;
+    }
+
+    winrt::com_ptr<IDXGIFactory> factory;
+    if (FAILED(CreateDXGIFactory(IID_PPV_ARGS(factory.put())))) {
+        return;
+    }
+
+    DXGI_ADAPTER_DESC best_desc{};
+    bool found = false;
+
+    for (UINT i = 0;; i++) {
+        winrt::com_ptr<IDXGIAdapter> adapter;
+        if (factory->EnumAdapters(i, adapter.put()) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+
+        DXGI_ADAPTER_DESC desc{};
+        if (FAILED(adapter->GetDesc(&desc))) {
+            continue;
+        }
+
+        // If a name is specified, check for a match.
+        if (gpu_name && *gpu_name) {
+            if (wcsstr(desc.Description, gpu_name)) {
+                best_desc = desc;
+                found = true;
+                break;
+            }
+        } else {
+            // Auto-select the one with most dedicated VRAM.
+            if (!found ||
+                desc.DedicatedVideoMemory > best_desc.DedicatedVideoMemory) {
+                best_desc = desc;
+                found = true;
+            }
+        }
+    }
+
+    if (found) {
+        if (dedicated) {
+            *dedicated = best_desc.DedicatedVideoMemory;
+        }
+        if (shared) {
+            *shared = best_desc.SharedSystemMemory;
+        }
+    }
 }
 
 std::optional<double> QueryDataCollectionSession::QueryDataAvg(
@@ -2269,12 +2480,16 @@ QueryDataCollectionSession::FilterNetworkPathsByAdapterName(
 }
 
 // Get the LUID for a GPU adapter by name using DXGI.
+// If gpu_name is empty, returns the LUID of the adapter with the most VRAM.
 std::wstring QueryDataCollectionSession::GetGpuLuidByName(PCWSTR gpu_name,
                                                           bool quiet) {
     winrt::com_ptr<IDXGIFactory> factory;
     if (FAILED(CreateDXGIFactory(IID_PPV_ARGS(factory.put())))) {
         return {};
     }
+
+    DXGI_ADAPTER_DESC best_desc{};
+    bool found = false;
 
     for (UINT i = 0;; i++) {
         winrt::com_ptr<IDXGIAdapter> adapter;
@@ -2288,21 +2503,37 @@ std::wstring QueryDataCollectionSession::GetGpuLuidByName(PCWSTR gpu_name,
         }
 
         if (!quiet) {
-            Wh_Log(L"DXGI adapter %u: %s (LUID: 0x%08X_0x%08X)", i,
+            Wh_Log(L"DXGI adapter %u: %s (LUID: 0x%08X_0x%08X, VRAM: %zu)", i,
                    desc.Description, desc.AdapterLuid.HighPart,
-                   desc.AdapterLuid.LowPart);
+                   desc.AdapterLuid.LowPart, desc.DedicatedVideoMemory);
         }
 
-        if (wcsstr(desc.Description, gpu_name)) {
-            WCHAR luid_str[32];
-            swprintf_s(luid_str, L"0x%08X_0x%08X", desc.AdapterLuid.HighPart,
-                       desc.AdapterLuid.LowPart);
-            if (!quiet) {
-                Wh_Log(L"Matched GPU: %s -> LUID %s", desc.Description,
-                       luid_str);
+        // If a name is specified, check for a match.
+        if (gpu_name && *gpu_name) {
+            if (wcsstr(desc.Description, gpu_name)) {
+                best_desc = desc;
+                found = true;
+                break;
             }
-            return luid_str;
+        } else {
+            // Auto-select the one with most VRAM.
+            if (!found ||
+                desc.DedicatedVideoMemory > best_desc.DedicatedVideoMemory) {
+                best_desc = desc;
+                found = true;
+            }
         }
+    }
+
+    if (found) {
+        WCHAR luid_str[32];
+        swprintf_s(luid_str, L"0x%08X_0x%08X", best_desc.AdapterLuid.HighPart,
+                   best_desc.AdapterLuid.LowPart);
+        if (!quiet) {
+            Wh_Log(L"Selected GPU: %s -> LUID %s", best_desc.Description,
+                   luid_str);
+        }
+        return luid_str;
     }
 
     return {};
@@ -2420,6 +2651,24 @@ void RemoveBracketedContent(std::wstring& str, wchar_t open, wchar_t close) {
 
 std::wstring RemoveBracketsFromString(std::wstring_view input) {
     if (!g_settings.mediaPlayer.removeBrackets) {
+        return std::wstring(input);
+    }
+
+    std::wstring result(input);
+    RemoveBracketedContent(result, L'(', L')');
+    RemoveBracketedContent(result, L'[', L']');
+
+    // Trim leading and trailing spaces
+    size_t startPos = result.find_first_not_of(L' ');
+    if (startPos == std::wstring::npos) {
+        return std::wstring();
+    }
+    size_t endPos = result.find_last_not_of(L' ');
+    return result.substr(startPos, endPos - startPos + 1);
+}
+
+std::wstring RemoveBracketsFromTitleString(std::wstring_view input) {
+    if (!g_settings.mediaPlayer.removeBracketsTitle) {
         return std::wstring(input);
     }
 
@@ -2563,16 +2812,18 @@ void RefreshMediaData() {
         auto artist = mediaProperties.Artist();
         auto album = mediaProperties.AlbumTitle();
 
+        // Create %media_title% with bracket removal
+        std::wstring processedTitleOnly = RemoveBracketsFromTitleString(title);
+
         StringCopyTruncatedWithEllipsis(g_mediaTitleFormatted.buffer,
                                         ARRAYSIZE(g_mediaTitleFormatted.buffer),
-                                        title.c_str());
-        StringCopyTruncatedWithEllipsis(
-            g_mediaArtistFormatted.buffer,
-            ARRAYSIZE(g_mediaArtistFormatted.buffer), artist.c_str());
+                                        processedTitleOnly.c_str());
+        StringCopyTruncatedWithEllipsis(g_mediaArtistFormatted.buffer,
+                                        ARRAYSIZE(g_mediaArtistFormatted.buffer),
+                                        artist.c_str());
         StringCopyTruncatedWithEllipsis(g_mediaAlbumFormatted.buffer,
                                         ARRAYSIZE(g_mediaAlbumFormatted.buffer),
                                         album.c_str());
-
         // Create combined info with bracket removal
         std::wstring processedArtist = RemoveBracketsFromString(artist);
         std::wstring processedTitle = RemoveBracketsFromString(title);
@@ -2629,6 +2880,18 @@ void DataCollectionSessionInit() {
         IsStrInDateTimePatternSettings(L"%cpu%");
     metrics[static_cast<int>(MetricType::kGpuUsage)] =
         IsStrInDateTimePatternSettings(L"%gpu%");
+    metrics[static_cast<int>(MetricType::kVramUsage)] =
+        IsStrInDateTimePatternSettings(L"%vram%");
+    metrics[static_cast<int>(MetricType::kVramUsed)] =
+        IsStrInDateTimePatternSettings(L"%vram_used%");
+    metrics[static_cast<int>(MetricType::kVramTotal)] =
+        IsStrInDateTimePatternSettings(L"%vram_total%");
+    metrics[static_cast<int>(MetricType::kVramSharedUsage)] =
+        IsStrInDateTimePatternSettings(L"%vram_shared%");
+    metrics[static_cast<int>(MetricType::kVramSharedUsed)] =
+        IsStrInDateTimePatternSettings(L"%vram_shared_used%");
+    metrics[static_cast<int>(MetricType::kVramSharedTotal)] =
+        IsStrInDateTimePatternSettings(L"%vram_shared_total%");
     metrics[static_cast<int>(MetricType::kCpuTemp)] =
         IsStrInDateTimePatternSettings(L"%cpu_temp%") ||
         IsStrInDateTimePatternSettings(L"%cpu_temp_f%");
@@ -2780,6 +3043,15 @@ void DataCollectionSampleIfNeeded() {
         }
 
         g_dataCollectionLastFormatIndex = dataCollectionFormatIndex;
+    }
+}
+
+void RamSampleIfNeeded() {
+    DWORD formatIndex = GetDataCollectionFormatIndex();
+    if (g_ramLastFormatIndex != formatIndex) {
+        g_ramStatus.dwLength = sizeof(g_ramStatus);
+        g_ramStatusValid = GlobalMemoryStatusEx(&g_ramStatus);
+        g_ramLastFormatIndex = formatIndex;
     }
 }
 
@@ -3082,15 +3354,90 @@ PCWSTR GetCpuFormatted() {
 PCWSTR GetRamFormatted() {
     return GetMetricFormatted(
         g_ramFormatted, [](PWSTR buffer, size_t bufferSize) {
-            MEMORYSTATUSEX status{
-                .dwLength = sizeof(status),
-            };
-            if (!GlobalMemoryStatusEx(&status)) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid) {
                 return false;
             }
             // Cap to 99 to keep identical width in all cases.
             int maxVal = 99;
-            FormatPercentValue(status.dwMemoryLoad, buffer, bufferSize, maxVal);
+            FormatPercentValue(g_ramStatus.dwMemoryLoad, buffer, bufferSize,
+                               maxVal);
+            return true;
+        });
+}
+
+PCWSTR GetRamUsedFormatted() {
+    return GetMetricFormatted(
+        g_ramUsedFormatted, [](PWSTR buffer, size_t bufferSize) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid) {
+                return false;
+            }
+            double usedGb =
+                (double)(g_ramStatus.ullTotalPhys - g_ramStatus.ullAvailPhys) /
+                (1024.0 * 1024.0 * 1024.0);
+            swprintf_s(buffer, bufferSize, L"%.1f", usedGb);
+            return true;
+        });
+}
+
+PCWSTR GetRamTotalFormatted() {
+    return GetMetricFormatted(
+        g_ramTotalFormatted, [](PWSTR buffer, size_t bufferSize) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid) {
+                return false;
+            }
+            double totalGb =
+                (double)g_ramStatus.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+            swprintf_s(buffer, bufferSize, L"%.1f", totalGb);
+            return true;
+        });
+}
+
+PCWSTR GetRamCommitedFormatted() {
+    return GetMetricFormatted(
+        g_ramCommitedFormatted, [](PWSTR buffer, size_t bufferSize) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid || g_ramStatus.ullTotalPageFile == 0) {
+                return false;
+            }
+            int committed = static_cast<int>(
+                ((g_ramStatus.ullTotalPageFile - g_ramStatus.ullAvailPageFile) *
+                 100) /
+                g_ramStatus.ullTotalPageFile);
+            // Cap to 99 to keep identical width in all cases.
+            int maxVal = 99;
+            FormatPercentValue(committed, buffer, bufferSize, maxVal);
+            return true;
+        });
+}
+
+PCWSTR GetRamCommitedUsedFormatted() {
+    return GetMetricFormatted(
+        g_ramCommitedUsedFormatted, [](PWSTR buffer, size_t bufferSize) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid) {
+                return false;
+            }
+            double usedGb = (double)(g_ramStatus.ullTotalPageFile -
+                                     g_ramStatus.ullAvailPageFile) /
+                            (1024.0 * 1024.0 * 1024.0);
+            swprintf_s(buffer, bufferSize, L"%.1f", usedGb);
+            return true;
+        });
+}
+
+PCWSTR GetRamCommitedTotalFormatted() {
+    return GetMetricFormatted(
+        g_ramCommitedTotalFormatted, [](PWSTR buffer, size_t bufferSize) {
+            RamSampleIfNeeded();
+            if (!g_ramStatusValid) {
+                return false;
+            }
+            double totalGb =
+                (double)g_ramStatus.ullTotalPageFile / (1024.0 * 1024.0 * 1024.0);
+            swprintf_s(buffer, bufferSize, L"%.1f", totalGb);
             return true;
         });
 }
@@ -3112,6 +3459,112 @@ PCWSTR GetGpuFormatted() {
         FormatPercentValue(static_cast<int>(*val), buffer, bufferSize, maxVal);
         return true;
     });
+}
+
+PCWSTR GetVramFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(g_vramFormatted, [](PWSTR buffer,
+                                                  size_t bufferSize) {
+        if (!g_dataCollectionSession) {
+            return false;
+        }
+        std::optional<double> val =
+            g_dataCollectionSession->QueryData(MetricType::kVramUsage);
+        if (!val) {
+            return false;
+        }
+        // Cap to 99 to keep identical width in all cases.
+        int maxVal = 99;
+        FormatPercentValue(static_cast<int>(*val), buffer, bufferSize, maxVal);
+        return true;
+    });
+}
+
+PCWSTR GetVramUsedFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(
+        g_vramUsedFormatted, [](PWSTR buffer, size_t bufferSize) {
+            if (!g_dataCollectionSession) {
+                return false;
+            }
+            std::optional<double> val =
+                g_dataCollectionSession->QueryData(MetricType::kVramUsed);
+            if (!val) {
+                return false;
+            }
+            swprintf_s(buffer, bufferSize, L"%.1f", *val);
+            return true;
+        });
+}
+
+PCWSTR GetVramTotalFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(
+        g_vramTotalFormatted, [](PWSTR buffer, size_t bufferSize) {
+            if (!g_dataCollectionSession) {
+                return false;
+            }
+            std::optional<double> val =
+                g_dataCollectionSession->QueryData(MetricType::kVramTotal);
+            if (!val) {
+                return false;
+            }
+            swprintf_s(buffer, bufferSize, L"%.1f", *val);
+            return true;
+        });
+}
+
+PCWSTR GetVramSharedFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(g_vramSharedFormatted, [](PWSTR buffer,
+                                                        size_t bufferSize) {
+        if (!g_dataCollectionSession) {
+            return false;
+        }
+        std::optional<double> val =
+            g_dataCollectionSession->QueryData(MetricType::kVramSharedUsage);
+        if (!val) {
+            return false;
+        }
+        // Cap to 99 to keep identical width in all cases.
+        int maxVal = 99;
+        FormatPercentValue(static_cast<int>(*val), buffer, bufferSize, maxVal);
+        return true;
+    });
+}
+
+PCWSTR GetVramSharedUsedFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(
+        g_vramSharedUsedFormatted, [](PWSTR buffer, size_t bufferSize) {
+            if (!g_dataCollectionSession) {
+                return false;
+            }
+            std::optional<double> val =
+                g_dataCollectionSession->QueryData(MetricType::kVramSharedUsed);
+            if (!val) {
+                return false;
+            }
+            swprintf_s(buffer, bufferSize, L"%.1f", *val);
+            return true;
+        });
+}
+
+PCWSTR GetVramSharedTotalFormatted() {
+    DataCollectionSampleIfNeeded();
+    return GetMetricFormatted(
+        g_vramSharedTotalFormatted, [](PWSTR buffer, size_t bufferSize) {
+            if (!g_dataCollectionSession) {
+                return false;
+            }
+            std::optional<double> val = g_dataCollectionSession->QueryData(
+                MetricType::kVramSharedTotal);
+            if (!val) {
+                return false;
+            }
+            swprintf_s(buffer, bufferSize, L"%.1f", *val);
+            return true;
+        });
 }
 
 PCWSTR GetCpuTempFormatted() {
@@ -3305,7 +3758,18 @@ size_t ResolveFormatToken(
         {L"%disk_total%"sv, GetDiskTotalSpeedFormatted},
         {L"%cpu%"sv, GetCpuFormatted},
         {L"%ram%"sv, GetRamFormatted},
+        {L"%ram_used%"sv, GetRamUsedFormatted},
+        {L"%ram_total%"sv, GetRamTotalFormatted},
+        {L"%ram_committed%"sv, GetRamCommitedFormatted},
+        {L"%ram_committed_used%"sv, GetRamCommitedUsedFormatted},
+        {L"%ram_committed_total%"sv, GetRamCommitedTotalFormatted},
         {L"%gpu%"sv, GetGpuFormatted},
+        {L"%vram%"sv, GetVramFormatted},
+        {L"%vram_used%"sv, GetVramUsedFormatted},
+        {L"%vram_total%"sv, GetVramTotalFormatted},
+        {L"%vram_shared%"sv, GetVramSharedFormatted},
+        {L"%vram_shared_used%"sv, GetVramSharedUsedFormatted},
+        {L"%vram_shared_total%"sv, GetVramSharedTotalFormatted},
         {L"%cpu_temp%"sv, GetCpuTempFormatted},
         {L"%cpu_temp_f%"sv, GetCpuTempFFormatted},
         {L"%battery%"sv, GetBatteryFormatted},
@@ -4001,16 +4465,21 @@ void WINAPI DateTimeIconContent_OnApplyTemplate_Hook(LPVOID pThis) {
 
     DateTimeIconContent_OnApplyTemplate_Original(pThis);
 
-    FrameworkElement dateTimeIconContent = nullptr;
-    ((IUnknown*)pThis)
-        ->QueryInterface(winrt::guid_of<FrameworkElement>(),
-                         winrt::put_abi(dateTimeIconContent));
-    if (!dateTimeIconContent) {
+    IUnknown* dateTimeIconContentElementIUnknownPtr = *((IUnknown**)pThis + 1);
+    if (!dateTimeIconContentElementIUnknownPtr) {
+        return;
+    }
+
+    FrameworkElement dateTimeIconContentElement = nullptr;
+    dateTimeIconContentElementIUnknownPtr->QueryInterface(
+        winrt::guid_of<FrameworkElement>(),
+        winrt::put_abi(dateTimeIconContentElement));
+    if (!dateTimeIconContentElement) {
         return;
     }
 
     try {
-        ApplyDateTimeIconContentStyles(dateTimeIconContent);
+        ApplyDateTimeIconContentStyles(dateTimeIconContentElement);
     } catch (...) {
         HRESULT hr = winrt::to_hresult();
         Wh_Log(L"Error %08X", hr);
@@ -4769,7 +5238,7 @@ bool HookSystemTraySymbols(HMODULE module) {
                 true,  // Added with feature flag 38762814
             },
             {
-                {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::DateTimeIconContent,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::OnApplyTemplate(void))"},
+                {LR"(public: void __cdecl winrt::SystemTray::implementation::DateTimeIconContent::OnApplyTemplate(void))"},
                 &DateTimeIconContent_OnApplyTemplate_Original,
                 DateTimeIconContent_OnApplyTemplate_Hook,
                 true,
@@ -4963,6 +5432,8 @@ void LoadSettings() {
         StringSetting::make(L"MediaPlayer.NoMediaText");
     g_settings.mediaPlayer.removeBrackets =
         Wh_GetIntSetting(L"MediaPlayer.RemoveBrackets");
+    g_settings.mediaPlayer.removeBracketsTitle =
+        Wh_GetIntSetting(L"MediaPlayer.RemoveBracketsTitle");
 
     g_settings.mediaPlayer.ignoredPlayers.clear();
     for (int i = 0;; i++) {
@@ -5325,9 +5796,9 @@ BOOL Wh_ModInit() {
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
     auto pKernelBaseLoadLibraryExW = (decltype(&LoadLibraryExW))GetProcAddress(
         kernelBaseModule, "LoadLibraryExW");
-    WindhawkUtils::SetFunctionHook(pKernelBaseLoadLibraryExW,
-                                   LoadLibraryExW_Hook,
-                                   &LoadLibraryExW_Original);
+    WindhawkUtils::Wh_SetFunctionHookT(pKernelBaseLoadLibraryExW,
+                                       LoadLibraryExW_Hook,
+                                       &LoadLibraryExW_Original);
 
     // Must use GetProcAddress for the functions below, otherwise the stubs in
     // kernel32.dll are being hooked.
@@ -5344,19 +5815,19 @@ BOOL Wh_ModInit() {
     }
 
     if (g_winVersion <= WinVersion::Win10) {
-        WindhawkUtils::SetFunctionHook(pGetTimeFormatEx,
-                                       GetTimeFormatEx_Hook_Win10,
-                                       &GetTimeFormatEx_Original);
-        WindhawkUtils::SetFunctionHook(pGetDateFormatEx,
-                                       GetDateFormatEx_Hook_Win10,
-                                       &GetDateFormatEx_Original);
+        WindhawkUtils::Wh_SetFunctionHookT(pGetTimeFormatEx,
+                                           GetTimeFormatEx_Hook_Win10,
+                                           &GetTimeFormatEx_Original);
+        WindhawkUtils::Wh_SetFunctionHookT(pGetDateFormatEx,
+                                           GetDateFormatEx_Hook_Win10,
+                                           &GetDateFormatEx_Original);
 
         auto pGetDateFormatW = (decltype(&GetDateFormatW))GetProcAddress(
             kernelBaseModule, "GetDateFormatW");
         if (pGetDateFormatW) {
-            WindhawkUtils::SetFunctionHook(pGetDateFormatW,
-                                           GetDateFormatW_Hook_Win10,
-                                           &GetDateFormatW_Original);
+            WindhawkUtils::Wh_SetFunctionHookT(pGetDateFormatW,
+                                               GetDateFormatW_Hook_Win10,
+                                               &GetDateFormatW_Original);
         }
     } else {
         if (g_winVersion >= WinVersion::Win11_22H2) {
@@ -5366,18 +5837,18 @@ BOOL Wh_ModInit() {
                 return FALSE;
             }
 
-            WindhawkUtils::SetFunctionHook(
+            WindhawkUtils::Wh_SetFunctionHookT(
                 pGetLocalTime, GetLocalTime_Hook_Win11, &GetLocalTime_Original);
         }
 
-        WindhawkUtils::SetFunctionHook(pGetTimeFormatEx,
-                                       GetTimeFormatEx_Hook_Win11,
-                                       &GetTimeFormatEx_Original);
-        WindhawkUtils::SetFunctionHook(pGetDateFormatEx,
-                                       GetDateFormatEx_Hook_Win11,
-                                       &GetDateFormatEx_Original);
-        WindhawkUtils::SetFunctionHook(SendMessageW, SendMessageW_Hook,
-                                       &SendMessageW_Original);
+        WindhawkUtils::Wh_SetFunctionHookT(pGetTimeFormatEx,
+                                           GetTimeFormatEx_Hook_Win11,
+                                           &GetTimeFormatEx_Original);
+        WindhawkUtils::Wh_SetFunctionHookT(pGetDateFormatEx,
+                                           GetDateFormatEx_Hook_Win11,
+                                           &GetDateFormatEx_Original);
+        WindhawkUtils::Wh_SetFunctionHookT(SendMessageW, SendMessageW_Hook,
+                                           &SendMessageW_Original);
     }
 
     g_initialized = true;
